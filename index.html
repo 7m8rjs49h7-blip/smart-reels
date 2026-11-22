@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<meta name="description" content="Lumen: short, genuinely informative videos and practical tips. No brain rot.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Lumen">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="stylesheet" href="styles.css">
+<title>Lumen — learn, don't scroll</title>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>Lumen</div>
+  <div class="top-right">
+    <span id="offlineBadge" class="badge offline" hidden>Offline</span>
+    <span id="timerPill" class="pill" title="Learning time today">0 min</span>
+  </div>
+</header>
+
+<main>
+  <section id="view-feed" class="view active">
+    <div id="feed" class="feed" aria-label="Learning feed"></div>
+  </section>
+
+  <section id="view-library" class="view page" hidden>
+    <h1>Library</h1>
+    <div class="seg" role="tablist">
+      <button class="seg-btn active" data-lib="saved">Saved</button>
+      <button class="seg-btn" data-lib="offline">Offline</button>
+    </div>
+    <div id="libSaved"></div>
+    <div id="libOffline" hidden>
+      <div class="card storage">
+        <div class="row"><strong>Stored for offline</strong><span id="storageUsed">0 MB</span></div>
+        <div class="bar"><div id="storageBar"></div></div>
+        <div class="row small muted"><span>Cap: <span id="capLabel"></span></span><span id="storageQuota"></span></div>
+        <div class="row gap">
+          <button class="btn ghost" id="clearRecent">Clear recent</button>
+          <button class="btn danger" id="clearAll">Delete all downloads</button>
+        </div>
+        <p class="small muted">Saved clips and your last 20 watched clips are kept automatically. Tip cards always work offline.</p>
+      </div>
+      <h2>Download packs</h2>
+      <div id="packs"></div>
+    </div>
+  </section>
+
+  <section id="view-settings" class="view page" hidden>
+    <h1>Settings</h1>
+    <div class="card">
+      <h3>Your topics</h3>
+      <div id="settingsTopics" class="chips"></div>
+    </div>
+    <div class="card">
+      <h3>Daily learning time</h3>
+      <p class="small muted">Lumen nudges you to stop once you hit this. It's a nudge, not a lock.</p>
+      <select id="limitSel">
+        <option value="0">No limit</option><option value="10">10 minutes</option><option value="15">15 minutes</option>
+        <option value="20">20 minutes</option><option value="30">30 minutes</option><option value="45">45 minutes</option><option value="60">60 minutes</option>
+      </select>
+    </div>
+    <div class="card">
+      <h3>Recap card</h3>
+      <select id="recapSel"><option value="4">Every 4 items</option><option value="5">Every 5 items</option><option value="8">Every 8 items</option><option value="0">Off</option></select>
+    </div>
+    <div class="card">
+      <h3>Offline storage cap</h3>
+      <select id="capSel"><option value="200">200 MB</option><option value="500">500 MB</option><option value="1000">1 GB</option><option value="2000">2 GB</option></select>
+      <label class="check"><input type="checkbox" id="autoRecent" checked> Keep my last 20 watched clips for offline</label>
+      <label class="check"><input type="checkbox" id="wifiOnly"> Only auto-download on unmetered connections (when the browser can tell)</label>
+    </div>
+    <div class="card">
+      <h3>Fresh content</h3>
+      <p class="small muted">When you're online, Lumen pulls new explainer cards from Wikipedia and a few new open-licensed videos from Wikimedia Commons, and saves them for offline. It follows your topics, the storage cap and the Wi-Fi-only setting.</p>
+      <p id="freshStatus" class="small">Not updated yet</p>
+      <button class="btn primary" id="refreshNow">Refresh content now</button>
+    </div>
+    <div class="card small muted">
+      <h3>About</h3>
+      <p>Videos come from Wikimedia Commons (public domain / Creative Commons, credited on every card) and from YouTube embeds of educational channels. "Did you know" cards are excerpts from Wikipedia (CC BY-SA 4.0, linked on each card). Tip cards are short written summaries of common guidance — not professional, medical, legal or financial advice. Everything you like, save and download stays on this device. No accounts, no tracking, no follower counts.</p>
+      <button class="btn ghost" id="resetApp">Reset app on this device</button>
+    </div>
+  </section>
+</main>
+
+<nav class="tabbar">
+  <button class="tab active" data-view="feed"><span>▶</span>Learn</button>
+  <button class="tab" data-view="library"><span>★</span>Library</button>
+  <button class="tab" data-view="settings"><span>⚙</span>Settings</button>
+</nav>
+
+<div id="onboard" class="overlay" hidden>
+  <div class="sheet">
+    <h1>What do you want to learn?</h1>
+    <p class="muted">Pick a few topics. You can change these any time.</p>
+    <div id="onboardTopics" class="chips"></div>
+    <button id="onboardGo" class="btn primary wide" disabled>Start learning</button>
+  </div>
+</div>
+
+<div id="nudge" class="overlay" hidden>
+  <div class="sheet center">
+    <div class="big">🌙</div>
+    <h2>Nice session.</h2>
+    <p id="nudgeText" class="muted"></p>
+    <button id="nudgeStop" class="btn primary wide">I'm done for today</button>
+    <button id="nudgeMore" class="btn ghost wide">5 more minutes</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js" defer></script>
+</body>
+</html>
