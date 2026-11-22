@@ -1,5 +1,5 @@
 /* Lumen service worker: app shell, catalog, thumbnails, and range-capable offline video. */
-const VERSION = 'v1.2.0';
+const VERSION = 'v1.3.0';
 const SHELL = 'lumen-shell-' + VERSION;
 const DATA = 'lumen-data';
 const IMG = 'lumen-img';

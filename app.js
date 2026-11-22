@@ -175,19 +175,20 @@ function itemHTML(it, idx) {
   if (it.kind === 'file') {
     return `<article class="item vid" data-id="${esc(it.id)}" data-idx="${idx}">
       <div class="poster" style="background-image:url('${esc(it.poster || '')}')"></div>
-      <video playsinline webkit-playsinline preload="none" ${S.muted ? 'muted' : ''} poster="${esc(it.poster || '')}"></video>
+      <video playsinline webkit-playsinline muted autoplay loop disablepictureinpicture preload="none" poster="${esc(it.poster || '')}"></video>
       <span class="dl" hidden>⬇ Offline</span>
-      <button class="sound">${S.muted ? '🔇 Tap for sound' : '🔊 Sound on'}</button>
-      <button class="playbig" hidden>▶</button>
+      <span class="tapicon" aria-hidden="true"></span>
+      <button class="playbig" hidden aria-label="Play">▶</button>
       <div class="shade"></div>${metaHTML(it)}${railHTML(it)}<div class="progress"><i></i></div></article>`;
   }
   if (it.kind === 'youtube') {
     return `<article class="item yt" data-id="${esc(it.id)}" data-idx="${idx}">
       <div class="poster" style="background-image:url('${esc(it.poster)}')"></div>
-      <div class="poster sharp" style="background-image:url('${esc(it.poster)}')"></div>
-      <span class="ytnote">YouTube · needs internet${it.length ? ' · ' + esc(it.length) : ''}</span>
-      <button class="playbig">▶</button>
-      <div class="shade"></div>${metaHTML(it)}${railHTML(it)}</article>`;
+      <div class="ytbox"><div class="ythost"></div><div class="ytcover" style="background-image:url('${esc(it.poster)}')"></div></div>
+      <div class="tapzone"></div>
+      <span class="tapicon" aria-hidden="true"></span>
+      <button class="playbig" hidden aria-label="Play">▶</button>
+      <div class="shade"></div>${metaHTML(it)}${railHTML(it)}<div class="progress"><i></i></div></article>`;
   }
   if (it.kind === 'tip' && it.format === 'fact') {
     const t = topicOf(it.topic);
@@ -228,7 +229,7 @@ function learnHTML(card) {
     <div class="fine">Try saying one of these out loud — recalling it helps it stick.</div>`;
 }
 function renderFeed(off) {
-  const f = $('#feed'); io.disconnect();
+  const f = $('#feed'); io.disconnect(); for (const [el] of [...ytPlayers]) unmountYT(el); activeEl = null;
   if (!feedItems.filter((x) => x.kind !== 'learn' && x.kind !== 'end').length) {
     f.innerHTML = `<div class="item enditem"><div class="tipcard" style="text-align:center"><div class="big">📭</div><h2>${off ? 'Nothing downloaded yet' : 'No items'}</h2><p class="muted">${off ? 'Save clips or download a topic pack while online to watch here offline.' : 'Pick some topics in Settings.'}</p></div></div>`;
     return;
@@ -240,40 +241,132 @@ function renderFeed(off) {
   feedItems.forEach((it) => { if (it.kind === 'file') { const s = pickSource(it); if (s && S.media[s.url]) markDownloaded(it.id); } });
 }
 
-function setVideoSrc(el, it) {
-  const v = $('video', el); if (!v || v.dataset.loaded) return v;
+function setVideoSrc(el, it, preload = 'metadata') {
+  const v = $('video', el); if (!v) return v;
+  if (v.dataset.loaded) { if (preload === 'auto' && v.preload !== 'auto') v.preload = 'auto'; return v; }
   const srcs = playableSources(it); let k = 0;
   const tryNext = () => { if (k >= srcs.length) return; v.src = srcs[k++].url; };
   v.addEventListener('error', () => { if (k < srcs.length) tryNext(); });
-  tryNext(); v.preload = 'metadata'; v.dataset.loaded = '1';
+  v.preload = preload; v.muted = !soundOn; tryNext(); v.dataset.loaded = '1';
   return v;
 }
 function unloadVideo(el) { const v = $('video', el); if (v && v.dataset.loaded) { v.pause(); v.removeAttribute('src'); v.load(); delete v.dataset.loaded; } }
-function unloadYT(el) { const fr = $('iframe', el); if (fr) { fr.remove(); $('.playbig', el).hidden = false; } }
+
+// ---------- sound (session-wide, starts muted so autoplay works on iOS) ----------
+let soundOn = false;
+function setSound(on, { fromGesture = false } = {}) {
+  soundOn = on;
+  $$('#feed video').forEach((v) => {
+    v.muted = !on;
+    // Inside a user gesture, "unlock" the loaded neighbours so WebKit lets them play with sound later.
+    if (fromGesture && on && v.dataset.loaded && v.paused && !(activeEl && activeEl.contains(v))) { const p = v.play(); if (p) p.then(() => v.pause()).catch(() => {}); }
+  });
+  for (const [, y] of ytPlayers) if (y.ready) { try { on ? y.p.unMute() : y.p.mute(); } catch (_) {} }
+  const b = $('#soundBtn'); if (b) { b.textContent = on ? '🔊' : '🔇'; b.setAttribute('aria-label', on ? 'Mute' : 'Unmute'); }
+}
+function flashIcon(el, txt) { const t = $('.tapicon', el); if (!t) return; t.textContent = txt; t.classList.remove('show'); void t.offsetWidth; t.classList.add('show'); }
+
+// ---------- YouTube IFrame API (youtube-nocookie) ----------
+const ytPlayers = new Map(); // article element -> { p, ready, want }
+let ytApi = null;
+function loadYT() {
+  if (ytApi) return ytApi;
+  ytApi = new Promise((res) => {
+    if (window.YT && window.YT.Player) return res(window.YT);
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => { if (prev) try { prev(); } catch (_) {} res(window.YT); };
+    const sc = document.createElement('script'); sc.src = 'https://www.youtube.com/iframe_api'; sc.async = true;
+    sc.onerror = () => { ytApi = null; res(null); }; document.head.appendChild(sc);
+  });
+  return ytApi;
+}
+const YT_VARS = (id) => ({ autoplay: 0, playsinline: 1, mute: 1, controls: 0, rel: 0, modestbranding: 1, iv_load_policy: 3, fs: 0, disablekb: 1, loop: 1, playlist: id, cc_load_policy: 0, hl: 'en', enablejsapi: 1, origin: location.origin });
+async function mountYT(el, it) {
+  if (ytPlayers.has(el) || !online()) return;
+  const rec = { p: null, ready: false, want: false }; ytPlayers.set(el, rec);
+  const YT = await loadYT(); if (!YT || ytPlayers.get(el) !== rec) return;
+  const host = $('.ythost', el); if (!host) return;
+  rec.p = new YT.Player(host, {
+    host: 'https://www.youtube-nocookie.com', videoId: it.youtubeId, width: '100%', height: '100%', playerVars: YT_VARS(it.youtubeId),
+    events: {
+      onReady: () => { rec.ready = true; const f = rec.p.getIframe && rec.p.getIframe(); if (f) { f.setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture'); f.title = it.title; }
+        if (soundOn) rec.p.unMute(); else rec.p.mute(); if (rec.want) ytPlay(el); },
+      onStateChange: (e) => {
+        const cover = $('.ytcover', el);
+        if (e.data === 1) { if (cover) cover.classList.add('gone'); $('.playbig', el).hidden = true; if (!rec.want) rec.p.pauseVideo(); }
+        if (e.data === 0) { rec.p.seekTo(0, true); rec.p.playVideo(); } // loop
+      },
+      onError: () => { $('.playbig', el).hidden = true; const c = $('.ytcover', el); if (c) c.classList.add('err'); },
+    },
+  });
+}
+function unmountYT(el) {
+  const rec = ytPlayers.get(el); if (!rec) return; ytPlayers.delete(el);
+  try { rec.p && rec.p.destroy(); } catch (_) {}
+  const box = $('.ytbox', el); if (box && !$('.ythost', box)) { const h = document.createElement('div'); h.className = 'ythost'; box.prepend(h); }
+  const c = $('.ytcover', el); if (c) c.classList.remove('gone');
+}
+function ytPlay(el) {
+  const rec = ytPlayers.get(el); if (!rec) return; rec.want = true; if (!rec.ready) return;
+  try { if (soundOn) rec.p.unMute(); else rec.p.mute(); rec.p.playVideo(); } catch (_) {}
+  // If WebKit refuses to start with sound, fall back to muted autoplay.
+  clearTimeout(rec.t); rec.t = setTimeout(() => {
+    if (!rec.want || !rec.ready) return; let st = -1; try { st = rec.p.getPlayerState(); } catch (_) {}
+    if (st !== 1 && st !== 3) { try { rec.p.mute(); rec.p.playVideo(); } catch (_) {}
+      setTimeout(() => { let s2 = -1; try { s2 = rec.p.getPlayerState(); } catch (_) {} if (rec.want && s2 !== 1 && s2 !== 3) $('.playbig', el).hidden = false; }, 2500); }
+  }, 2500);
+}
+function ytPause(el) { const rec = ytPlayers.get(el); if (!rec) return; rec.want = false; clearTimeout(rec.t); if (rec.ready) try { rec.p.pauseVideo(); } catch (_) {} }
+
+// ---------- playback control ----------
+function playFile(el, it) {
+  const v = setVideoSrc(el, it, 'auto'); if (!v) return;
+  v.muted = !soundOn; v.dataset.user = '';
+  const p = v.play();
+  if (p) p.catch(() => {
+    if (!v.muted) { v.muted = true; v.play().catch(() => ($('.playbig', el).hidden = false)); toast('Tap anywhere for sound'); }
+    else $('.playbig', el).hidden = false;
+  });
+}
+function pauseItem(el) { if (!el) return; const v = $('video', el); if (v) v.pause(); ytPause(el); }
+function pauseAll() { $$('#feed video').forEach((v) => v.pause()); for (const [el] of ytPlayers) ytPause(el); }
+function playActive() { if (!activeEl) return; const it = feedItems[+activeEl.dataset.idx]; if (!it) return;
+  if (it.kind === 'file') playFile(activeEl, it); else if (it.kind === 'youtube') ytPlay(activeEl); }
+let ytTick = null;
+function trackYTProgress(el) {
+  clearInterval(ytTick);
+  ytTick = setInterval(() => { if (activeEl !== el) return clearInterval(ytTick); const rec = ytPlayers.get(el); if (!rec || !rec.ready) return;
+    try { const d = rec.p.getDuration(), t = rec.p.getCurrentTime(); if (d) $('.progress i', el).style.width = (100 * t / d) + '%'; } catch (_) {} }, 400);
+}
 
 function activate(el) {
   if (activeEl === el) return;
-  if (activeEl) { const v = $('video', activeEl); if (v) v.pause(); unloadYT(activeEl); }
+  if (activeEl) pauseItem(activeEl);
   activeEl = el;
   const idx = +el.dataset.idx; const it = feedItems[idx];
-  // load neighbors, unload far
-  $$('#feed .item.vid').forEach((x) => { const d = Math.abs(+x.dataset.idx - idx); if (d > 2) unloadVideo(x); else setVideoSrc(x, feedItems[+x.dataset.idx]); });
+  // Keep previous/current/next warm, unmount far items to save memory.
+  $$('#feed .item').forEach((x) => {
+    const i = +x.dataset.idx; const d = i - idx; const xi = feedItems[i]; if (!xi) return;
+    if (xi.kind === 'file') { if (Math.abs(d) > 2) unloadVideo(x); else if (d !== 0) setVideoSrc(x, xi, d === 1 ? 'auto' : 'metadata'); }
+    if (xi.kind === 'youtube') { if (Math.abs(d) <= 1) mountYT(x, xi); else unmountYT(x); }
+  });
   if (!it) return;
   if (it.kind !== 'learn' && it.kind !== 'end') { S.seen[it.id] = Date.now(); save(); }
   if (it.kind === 'file') {
-    const v = setVideoSrc(el, it); v.muted = S.muted;
-    const p = v.play(); if (p) p.catch(() => { $('.playbig', el).hidden = false; });
+    playFile(el, it);
+    const v = $('video', el);
     if (!v.dataset.wired) {
       v.dataset.wired = '1'; let counted = false;
       v.addEventListener('timeupdate', () => {
         const bar = $('.progress i', el); if (v.duration) bar.style.width = (100 * v.currentTime / v.duration) + '%';
         if (!counted && v.currentTime > 3) { counted = true; trackRecent(it); }
       });
-      v.addEventListener('play', () => ($('.playbig', el).hidden = true));
-      v.addEventListener('ended', () => ($('.playbig', el).hidden = false));
+      v.addEventListener('playing', () => ($('.playbig', el).hidden = true));
     }
   }
+  if (it.kind === 'youtube') { if (!online()) return; mountYT(el, it); ytPlay(el); trackYTProgress(el); }
 }
+document.addEventListener('visibilitychange', () => { if (document.hidden) pauseAll(); else if (!$('#view-feed').hidden && $('#nudge').hidden) playActive(); });
 
 // ---------- interactions ----------
 $('#feed').addEventListener('click', async (e) => {
@@ -283,22 +376,26 @@ $('#feed').addEventListener('click', async (e) => {
   if (b?.classList.contains('like')) { S.likes[it.id] ? delete S.likes[it.id] : (S.likes[it.id] = Date.now()); save(); b.classList.toggle('liked', !!S.likes[it.id]); b.textContent = S.likes[it.id] ? '♥' : '♡'; return; }
   if (b?.classList.contains('save')) { toggleSave(it); b.classList.toggle('on', !!S.saves[it.id]); b.textContent = S.saves[it.id] ? '★' : '☆'; return; }
   if (b?.classList.contains('share')) { share(it); return; }
-  if (b?.classList.contains('sound')) { S.muted = !S.muted; save(); $$('#feed video').forEach((v) => (v.muted = S.muted)); $$('#feed .sound').forEach((s) => (s.textContent = S.muted ? '🔇 Tap for sound' : '🔊 Sound on')); return; }
   if (b?.classList.contains('opt')) { answer(b); return; }
   if (b?.id === 'nextSet') { S.setIndex++; save(); buildFeed(); return; }
   if (b?.id === 'goLib') { show('library'); return; }
-  if (it?.kind === 'youtube' && (b?.classList.contains('playbig') || e.target.closest('.poster'))) {
-    if (!online()) { toast('YouTube clips need internet'); return; }
-    const fr = document.createElement('iframe');
-    fr.src = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(it.youtubeId)}?autoplay=1&playsinline=1&rel=0&modestbranding=1`;
-    fr.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen'; fr.allowFullscreen = true; fr.title = it.title;
-    el.appendChild(fr); $('.playbig', el).hidden = true; S.seen[it.id] = Date.now(); save(); return;
-  }
-  if (it?.kind === 'file' && !e.target.closest('.meta a')) {
-    const v = $('video', el); if (!v) return;
-    if (b?.classList.contains('playbig') || v.paused) { v.muted = S.muted; v.play().catch(() => {}); } else v.pause();
+  if ((it?.kind === 'youtube' || it?.kind === 'file') && !e.target.closest('.meta a, .rail')) {
+    if (it.kind === 'youtube' && !online()) { toast('YouTube clips need internet'); return; }
+    // First tap turns sound on (TikTok-style); after that a tap toggles pause/resume.
+    if (!soundOn || b?.classList.contains('playbig')) {
+      if (!soundOn) { setSound(true, { fromGesture: true }); flashIcon(el, '🔊'); }
+      const v = $('video', el); if (v) { v.muted = false; v.play().catch(() => { v.muted = true; v.play().catch(() => {}); }); }
+      else { const rec = ytPlayers.get(el); if (rec && rec.ready) { rec.want = true; rec.p.unMute(); rec.p.playVideo(); } else ytPlay(el); }
+      $('.playbig', el).hidden = true; return;
+    }
+    const v = $('video', el);
+    if (v) { if (v.paused) { v.play().catch(() => {}); flashIcon(el, '▶'); } else { v.pause(); flashIcon(el, '❚❚'); } return; }
+    const rec = ytPlayers.get(el); if (!rec || !rec.ready) return;
+    let st = -1; try { st = rec.p.getPlayerState(); } catch (_) {}
+    if (st === 1 || st === 3) { ytPause(el); flashIcon(el, '❚❚'); } else { rec.want = true; rec.p.playVideo(); flashIcon(el, '▶'); }
   }
 });
+$('#soundBtn').addEventListener('click', () => { setSound(!soundOn, { fromGesture: true }); if (soundOn && activeEl) { const v = $('video', activeEl); if (v && v.paused) v.play().catch(() => {}); } });
 function answer(btn) {
   const wrap = btn.parentElement; if (wrap.dataset.done) return; wrap.dataset.done = '1';
   const right = +wrap.dataset.answer; const picked = +btn.dataset.i;
@@ -329,8 +426,8 @@ async function share(it) {
 function show(view) {
   $$('.view').forEach((v) => { const on = v.id === 'view-' + view; v.hidden = !on; v.classList.toggle('active', on); });
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === view));
-  if (view !== 'feed') { $$('#feed video').forEach((v) => v.pause()); if (activeEl) unloadYT(activeEl); }
-  else if (activeEl) { const v = $('video', activeEl); if (v && v.dataset.loaded) v.play().catch(() => {}); }
+  if (view !== 'feed') pauseAll();
+  else playActive();
   if (view === 'library') renderLibrary();
   if (view === 'settings') renderSettings();
 }
@@ -419,7 +516,7 @@ function updateTimer() {
   const m = Math.floor(S.time.secs / 60); const lim = S.settings.limit;
   $('#timerPill').textContent = lim ? `${m}/${lim} min` : `${m} min`;
   if (lim && !S.time.done && S.time.secs >= lim * 60 && S.time.secs >= S.time.snoozeUntil && $('#nudge').hidden) {
-    $$('#feed video').forEach((v) => v.pause());
+    pauseAll();
     $('#nudgeText').textContent = `You've spent ${m} minutes learning today — your goal was ${lim}. Stopping here helps it sink in.`;
     $('#nudge').hidden = false;
   }
@@ -630,8 +727,9 @@ function refreshContent({ manual = false } = {}) {
     if (n) toast(`${n} new item${n === 1 ? '' : 's'} saved for offline`, 3000);
     else if (manual) toast('No new items right now — try again later');
     // Only rebuild the feed if the user is still at the top, so nothing jumps under their finger.
-    const idx = activeEl ? +activeEl.dataset.idx : 0;
-    if (n && idx <= 0 && !$('#view-feed').hidden) { activeEl = null; await buildFeed(); }
+    // Never swap the feed under the viewer; only fill it if it was empty. New items show in the next set / next open.
+    const hasMedia = feedItems.some((x) => x.kind !== 'learn' && x.kind !== 'end');
+    if (n && !hasMedia) { activeEl = null; await buildFeed(); }
     return res;
   })().catch((e) => { setFreshStatus(); if (manual) toast('Refresh failed: ' + e.message); return { ok: false, error: e.message }; })
     .finally(() => { freshBusy = null; });
@@ -666,7 +764,7 @@ async function boot() {
   updateOnline(false); updateTimer();
   if (!S.topics.length) await onboard();
   await buildFeed();
-  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, fresh: () => CAT.items.filter((i) => i.fresh) };
+  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, fresh: () => CAT.items.filter((i) => i.fresh) };
   setTimeout(() => refreshContent(), 2000);
 }
 boot();
