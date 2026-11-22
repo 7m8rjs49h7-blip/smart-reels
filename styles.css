@@ -99,3 +99,4 @@ select{width:100%;padding:11px;border-radius:12px;background:var(--card2);color:
 .newb{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;background:#3ddc97;color:#06281a;font-size:11px;font-weight:700;vertical-align:middle}
 .tipcard.fact p{margin:.55em 0;line-height:1.5}
 #freshStatus{margin:.4em 0 .8em}
+.tipcard .fine a{color:inherit;text-decoration:underline}
