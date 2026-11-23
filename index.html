@@ -12,6 +12,10 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="preconnect" href="https://upload.wikimedia.org" crossorigin>
+<link rel="preconnect" href="https://i.ytimg.com">
+<link rel="dns-prefetch" href="https://www.youtube-nocookie.com">
+<link rel="preload" href="data/catalog.json" as="fetch" crossorigin>
 <link rel="stylesheet" href="styles.css">
 <title>Lumen — learn, don't scroll</title>
 </head>
@@ -27,7 +31,8 @@
 
 <main>
   <section id="view-feed" class="view active">
-    <div id="feed" class="feed" aria-label="Learning feed"></div>
+    <div id="offlineBar" class="offlinebar" hidden></div>
+    <div id="feed" class="feed" aria-label="Learning feed"><div id="bootSkel" class="bootskel" aria-hidden="true"><div class="skel"></div><div class="sk-meta"><i></i><i></i><i></i></div></div></div>
   </section>
 
   <section id="view-library" class="view page" hidden>
@@ -55,6 +60,10 @@
 
   <section id="view-settings" class="view page" hidden>
     <h1>Settings</h1>
+    <div class="card vercard">
+      <div class="row"><div><h3 style="margin:0">Lumen <span id="appVer">v1.5.0</span></h3><p id="verStatus" class="small muted" style="margin:4px 0 0">Checking for updates…</p></div>
+      <button class="btn sm primary" id="checkUpd">Check for updates</button></div>
+    </div>
     <div class="card">
       <h3>Your topics</h3>
       <div id="settingsTopics" class="chips"></div>
@@ -86,7 +95,7 @@
     <div class="card small muted">
       <h3>About</h3>
       <p>Videos come from Wikimedia Commons (public domain / Creative Commons, credited on every card) and from YouTube embeds of educational channels. "Did you know" cards are excerpts from Wikipedia (CC BY-SA 4.0, linked on each card). Tip cards are short written summaries of common guidance — not professional, medical, legal or financial advice. Everything you like, save and download stays on this device. No accounts, no tracking, no follower counts.</p>
-      <p class="small">Version <span id="appVer">v1.4.1</span></p>
+      <p class="small">Version <span class="appVer2">v1.5.0</span></p>
       <button class="btn ghost" id="resetApp">Reset app on this device</button>
     </div>
   </section>
@@ -118,6 +127,7 @@
 </div>
 
 <div id="toast" class="toast" hidden></div>
+<button id="updToast" class="updtoast" hidden>✨ Update available · tap to refresh</button>
 <script src="app.js" defer></script>
 </body>
 </html>

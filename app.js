@@ -7,10 +7,11 @@ const KEY = 'lumen.v1';
 const MEDIA_CACHE = 'lumen-media';
 const RECENT_MAX = 20;
 const SET_SIZE = 36;
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.5.0';
 const REFILL_AT = 5;      // append the next batch when this close to the end
 const NO_REPEAT = 30;     // don't repeat any of the last ~30 items
-const HYDRATE_NEAR = 6, DRY_FAR = 12; // keep DOM bounded: only slides near the viewer hold real content // items per finite "set" — no infinite scroll
+const HYDRATE_NEAR = 6, DRY_FAR = 12;
+const POOL_N = 3;         // shared <video> elements, reused slide to slide (one tap unlocks them all on strict iOS) // keep DOM bounded: only slides near the viewer hold real content // items per finite "set" — no infinite scroll
 
 const defaults = { topics: [], likes: {}, saves: {}, seen: {}, recent: [], media: {}, packs: {},
   settings: { limit: 30, recap: 5, cap: 500, autoRecent: true, wifiOnly: false },
@@ -36,12 +37,17 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 // ---------- source selection ----------
 const probe = document.createElement('video');
+// iPhone/iPad (every iOS browser, Brave included, is WebKit) decode MPEG-4 in hardware; VP9 WebM is spotty there.
+const APPLE = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+  (/Apple/.test(navigator.vendor || '') && !/Chrome|CriOS|FxiOS|Android/.test(navigator.userAgent));
 function pickSource(item) {
   if (item.kind !== 'file') return null;
   const ok = item.sources.filter((s) => {
     if (s.type === 'video/webm') return probe.canPlayType('video/webm; codecs="vp9, opus"') || probe.canPlayType('video/webm; codecs="vp9"');
     return probe.canPlayType('video/mp4') || probe.canPlayType('video/quicktime');
   });
+  const have = ok.find((s) => S.media[s.url]); if (have) return have; // keep using what's already saved offline
+  if (APPLE) { const m = ok.find((s) => s.type === 'video/mp4'); if (m) return m; }
   return ok[0] || null;
 }
 function playableSources(item) {
@@ -126,7 +132,7 @@ async function feedPool() {
   let pool = CAT.items.filter((it) => sel.has(it.topic));
   const off = !online();
   if (off) { const cached = await availableOffline(); pool = pool.filter((it) => it.kind === 'tip' || cached.has(it.id)); }
-  else pool = pool.filter((it) => it.kind !== 'file' || pickSource(it));
+  else pool = pool.filter((it) => (it.kind !== 'file' || pickSource(it)) && !(it.kind === 'youtube' && S.badYT && S.badYT[it.id]));
   return { pool, off };
 }
 // One batch: unseen first (shuffled, categories interleaved), then the least-recently-seen in a fresh order; formats mixed.
@@ -135,8 +141,9 @@ function nextBatch(pool, off, rnd, exclude) {
   const unseen = (l) => l.filter((x) => !S.seen[x.id]);
   const oldest = (l) => { const s2 = l.filter((x) => S.seen[x.id]).sort((a, b) => S.seen[a.id] - S.seen[b.id]); return shuffle(s2.slice(0, Math.max(SET_SIZE * 2, Math.ceil(s2.length / 2))), rnd).concat(s2.slice(Math.max(SET_SIZE * 2, Math.ceil(s2.length / 2)))); };
   const order = (l) => [...interleaveTopics(shuffle(unseen(l), rnd), rnd), ...interleaveTopics(oldest(l), rnd)];
-  const weave = (l) => { const f = l.filter((x) => x.kind === 'file'), y = l.filter((x) => x.kind !== 'file'); const out = [];
-    while (f.length || y.length) { if (y.length) out.push(y.shift()); if (f.length) out.push(f.shift()); if (y.length) out.push(y.shift()); } return out; };
+  // Native video first (it truly autoplays everywhere); YouTube woven in less often, even less when the device blocks autoplay.
+  const weave = (l) => { const f = l.filter((x) => x.kind === 'file'), y = l.filter((x) => x.kind !== 'file'); const out = []; const run = autoplayStrict ? 4 : 2;
+    while (f.length || y.length) { for (let k = 0; k < run && f.length; k++) out.push(f.shift()); if (y.length) out.push(y.shift()); } return out; };
   const liked = new Set(Object.keys(S.likes).map((id) => byId.get(id)?.topic).filter(Boolean));
   const boost = (l) => l.sort((a, b) => (liked.has(b.topic) && !S.seen[b.id]) - (liked.has(a.topic) && !S.seen[a.id]));
   const V = weave(boost(order(avail.filter((i) => i.kind !== 'tip')))), T = order(avail.filter((i) => i.kind === 'tip'));
@@ -229,8 +236,7 @@ function metaHTML(it) {
 function itemHTML(it, idx) {
   if (it.kind === 'file') {
     return `<article class="item vid" data-id="${esc(it.id)}" data-idx="${idx}">
-      <div class="poster" style="background-image:url('${esc(it.poster || '')}')"></div>
-      <video playsinline webkit-playsinline muted autoplay loop disablepictureinpicture preload="none" poster="${esc(it.poster || '')}"></video>
+      <div class="poster" style="background-image:url('${esc(it.poster || '')}')"></div><div class="skel"></div>
       <span class="dl" hidden>⬇ Offline</span>
       <span class="tapicon" aria-hidden="true"></span>
       <button class="playbig" hidden aria-label="Play">▶</button>
@@ -239,7 +245,7 @@ function itemHTML(it, idx) {
   if (it.kind === 'youtube') {
     return `<article class="item yt" data-id="${esc(it.id)}" data-idx="${idx}">
       <div class="poster" style="background-image:url('${esc(it.poster)}')"></div>
-      <div class="ytbox"><div class="ythost"></div><div class="ytcover" style="background-image:url('${esc(it.poster)}')"></div></div>
+      <div class="ytbox"><div class="ythost"></div><div class="ytcover" style="background-image:url('${esc(it.poster)}')"></div><div class="skel"></div></div>
       <div class="tapzone"></div>
       <span class="tapicon" aria-hidden="true"></span>
       <button class="playbig" hidden aria-label="Play">▶</button>
@@ -284,9 +290,9 @@ function learnHTML(card) {
     <div class="fine">Try saying one of these out loud — recalling it helps it stick.</div>`;
 }
 function renderFeed(off) {
-  const f = $('#feed'); io.disconnect(); for (const [el] of [...ytPlayers]) unmountYT(el); activeEl = null;
+  const f = $('#feed'); io.disconnect(); for (const [el] of [...ytPlayers]) unmountYT(el); vpool.forEach(releaseVideo); activeEl = null;
   if (!feedItems.filter((x) => x.kind !== 'learn' && x.kind !== 'end').length) {
-    f.innerHTML = `<div class="item enditem"><div class="tipcard" style="text-align:center"><div class="big">📭</div><h2>${off ? 'Nothing downloaded yet' : 'No items'}</h2><p class="muted">${off ? 'Save clips or download a topic pack while online to watch here offline.' : 'Pick some topics in Settings.'}</p></div></div>`;
+    f.innerHTML = `<div class="item enditem"><div class="tipcard" style="text-align:center"><div class="big">📭</div><h2>${off ? 'Nothing saved for offline yet' : 'No items'}</h2><p class="muted">${off ? 'Next time you’re online, open Library → Offline and download a topic pack. Clips you watch are also kept automatically.' : 'Pick some topics in Settings.'}</p>${off ? '<button class="btn ghost wide" id="goLib">Open Library</button>' : ''}</div></div>`;
     return;
   }
   f.innerHTML = feedItems.map(itemHTML).join('');
@@ -296,29 +302,85 @@ function renderFeed(off) {
   feedItems.forEach((it) => { if (it.kind === 'file') { const s = pickSource(it); if (s && S.media[s.url]) markDownloaded(it.id); } });
 }
 
+// ---------- shared video pool ----------
+// A few <video> elements are reused from slide to slide. On iOS a play() made inside any tap "unlocks" an element for
+// good, so after the first touch every later clip can start (with sound) on its own, even in Low Power Mode.
+const vpool = []; const vlog = [];
+let autoplayStrict = false; // the device refused muted inline autoplay (iOS Low Power Mode, some data savers)
+let userPaused = false;
+function makeVideo() {
+  const v = document.createElement('video');
+  v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', ''); v.setAttribute('disablepictureinpicture', ''); v.setAttribute('x-webkit-airplay', 'deny');
+  v.muted = true; v.defaultMuted = true; v.loop = true; v.preload = 'none';
+  v.addEventListener('error', () => {
+    if (!v.getAttribute('src') || !v._srcs) return; // released / emptied element: not a real failure
+    vlog.push({ it: v._it, k: v._k, code: v.error && v.error.code, t: Date.now() }); if (vlog.length > 40) vlog.shift();
+    if (v._k < v._srcs.length) v.src = v._srcs[v._k++].url;
+    else if (!v._retried) { v._retried = true; v._k = 0; const it = v._it; setTimeout(() => { if (v._it === it) v.src = v._srcs[v._k++].url; if (v._el === activeEl && !userPaused) v.play().catch(() => {}); }, 1500); return; }
+    else return;
+    if (v._el && v._el === activeEl && !userPaused) v.play().catch(() => {});
+  });
+  v.addEventListener('timeupdate', () => {
+    const el = v._el; if (!el) return; const bar = $('.progress i', el); if (bar && v.duration) bar.style.width = (100 * v.currentTime / v.duration) + '%';
+    if (!v._counted && v.currentTime > 3 && el === activeEl) { v._counted = true; const it = byId.get(v._it); if (it) trackRecent(it); }
+  });
+  v.addEventListener('playing', () => { const el = v._el; if (!el) return; el.classList.add('live'); const pb = $('.playbig', el); if (pb) pb.hidden = true; hideHint(el); });
+  vpool.push(v); return v;
+}
+function releaseVideo(v) {
+  if (!v) return; v.pause(); if (v._el) v._el.classList.remove('live');
+  v._el = null; v._it = null; v.remove(); v.removeAttribute('src'); try { v.load(); } catch (_) {} delete v.dataset.loaded;
+}
 function setVideoSrc(el, it, preload = 'metadata') {
-  const v = $('video', el); if (!v) return v;
-  if (v.dataset.loaded) { if (preload === 'auto' && v.preload !== 'auto') v.preload = 'auto'; return v; }
-  const srcs = playableSources(it); let k = 0;
-  const tryNext = () => { if (k >= srcs.length) return; v.src = srcs[k++].url; };
-  v.addEventListener('error', () => { if (k < srcs.length) tryNext(); });
-  v.preload = preload; v.muted = !soundOn; tryNext(); v.dataset.loaded = '1';
+  let v = $('video', el);
+  if (v && v._it === it.id) { if (preload === 'auto' && v.preload !== 'auto') v.preload = 'auto'; return v; }
+  if (v) releaseVideo(v);
+  v = vpool.find((x) => !x._el) || (vpool.length < POOL_N ? makeVideo() : null);
+  if (!v) { // pool busy: reuse the one farthest from the viewer
+    const cur = activeEl ? +activeEl.dataset.idx : 0;
+    v = vpool.filter((x) => x._el !== activeEl).sort((a, b) => Math.abs(+b._el.dataset.idx - cur) - Math.abs(+a._el.dataset.idx - cur))[0];
+    if (!v) return null; releaseVideo(v);
+  }
+  v._el = el; v._it = it.id; v._srcs = playableSources(it); v._k = 0; v._counted = false; v._retried = false;
+  v.poster = it.poster || ''; v.preload = preload; v.muted = !soundOn;
+  const anchor = $('.poster', el); if (anchor) anchor.after(v); else el.prepend(v);
+  if (v._srcs.length) v.src = v._srcs[v._k++].url;
+  v.dataset.loaded = '1'; const bar = $('.progress i', el); if (bar) bar.style.width = '0';
   return v;
 }
-function unloadVideo(el) { const v = $('video', el); if (v && v.dataset.loaded) { v.pause(); v.removeAttribute('src'); v.load(); delete v.dataset.loaded; } }
+function unloadVideo(el) { const v = $('video', el); if (v) releaseVideo(v); }
+const gestureNow = () => { const ua = navigator.userActivation; return !ua || ua.isActive; };
+// Must run synchronously inside a user gesture (tap, swipe end, key). Cheap after the first time.
+function unlockMedia() {
+  if (!gestureNow()) return;
+  while (vpool.length < POOL_N) makeVideo();
+  for (const v of vpool) {
+    if (v._unlocked) continue; v._unlocked = true;
+    const keep = () => v._el && v._el === activeEl && !userPaused;
+    if (keep() && !v.paused) continue;
+    v.muted = true;
+    try { const p = v.play(); if (p) p.then(() => { if (!keep()) v.pause(); v.muted = !soundOn; }).catch(() => { v.muted = !soundOn; }); } catch (_) {}
+  }
+}
+['touchend', 'pointerup', 'click', 'keydown'].forEach((t) => document.addEventListener(t, unlockMedia, { capture: true, passive: true }));
+function showHint(el, txt) {
+  if (!el || $('.hint', el)) return;
+  const h = document.createElement('div'); h.className = 'hint'; h.textContent = txt || 'Tap anywhere to start';
+  el.appendChild(h);
+}
+function hideHint(el) { const h = el && $('.hint', el); if (h) h.remove(); }
 
 // ---------- sound (session-wide, starts muted so autoplay works on iOS) ----------
 let soundOn = false;
 function setSound(on, { fromGesture = false } = {}) {
   soundOn = on;
-  $$('#feed video').forEach((v) => {
-    v.muted = !on;
-    // Inside a user gesture, "unlock" the loaded neighbours so WebKit lets them play with sound later.
-    if (fromGesture && on && v.dataset.loaded && v.paused && !(activeEl && activeEl.contains(v))) { const p = v.play(); if (p) p.then(() => v.pause()).catch(() => {}); }
-  });
+  if (fromGesture) unlockMedia();
+  for (const v of vpool) v.muted = !on;
   for (const [, y] of ytPlayers) if (y.ready) { try { on ? y.p.unMute() : y.p.mute(); } catch (_) {} }
   const b = $('#soundBtn'); if (b) { b.textContent = on ? '🔊' : '🔇'; b.setAttribute('aria-label', on ? 'Mute' : 'Unmute'); }
 }
+// Haptic-like feedback: a springy pop + burst ring (and a tiny vibration where the browser supports it).
+function pop(b, on) { b.classList.remove('pop', 'burst'); void b.offsetWidth; b.classList.add('pop'); if (on) b.classList.add('burst'); try { navigator.vibrate && navigator.vibrate(on ? 12 : 6); } catch (_) {} }
 function flashIcon(el, txt) { const t = $('.tapicon', el); if (!t) return; t.textContent = txt; t.classList.remove('show'); void t.offsetWidth; t.classList.add('show'); }
 
 // ---------- YouTube IFrame API (youtube-nocookie) ----------
@@ -363,6 +425,7 @@ function rawPlayer(el, it, rec, onState) {
     destroy: () => f.remove(),
     _msg: (d) => {
       if (d.event === 'onReady') { rec.ready = true; afterReady(); }
+      if (d.event === 'onError') { rec.err = true; ytUnavailable(el, it, d.info); return; }
       const info = d.info; if (info == null) return;
       if (d.event === 'onStateChange' && typeof info === 'number') { st.ps = info; onState(info); }
       if (typeof info === 'object') {
@@ -377,8 +440,6 @@ function rawPlayer(el, it, rec, onState) {
     hello(); setTimeout(hello, 400); setTimeout(hello, 1200);
     // Even if the player never answers (no messages), treat it as ready so commands are still sent.
     setTimeout(afterReady, 1500);
-    // Our thumbnail never sits on top of a live player: reveal YouTube's own frame shortly after load.
-    setTimeout(() => { const c = $('.ytcover', el); if (c) c.classList.add('gone'); }, 1800);
   });
   return p;
 }
@@ -391,7 +452,7 @@ window.addEventListener('message', (e) => {
 function ytStateHandler(el, rec) {
   return (state) => {
     const cover = $('.ytcover', el);
-    if (state === 1) { if (cover) cover.classList.add('gone'); $('.playbig', el).hidden = true; el.classList.remove('ytpass'); if (!rec.want) rec.p.pauseVideo(); }
+    if (state === 1) { if (cover) cover.classList.add('gone'); el.classList.add('live'); $('.playbig', el).hidden = true; el.classList.remove('ytpass'); hideHint(el); if (!rec.want) rec.p.pauseVideo(); }
     if (state === 0 && !rec.p.raw) { rec.p.seekTo(0, true); rec.p.playVideo(); } // loop (raw iframe loops via playlist=ID)
   };
 }
@@ -419,11 +480,17 @@ async function mountYT(el, it, { active = false } = {}) {
       onReady: () => { rec.ready = true; const f = rec.p.getIframe && rec.p.getIframe(); if (f) { f.setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture'); f.title = it.title; }
         if (soundOn) rec.p.unMute(); else rec.p.mute(); if (rec.want) ytPlay(el); },
       onStateChange: (e) => onState(e.data),
-      onError: () => { const c = $('.ytcover', el); if (c) c.classList.add('gone'); },
+      onError: (e) => { rec.err = true; ytUnavailable(el, it, e && e.data); },
     },
   });
   // If the API loaded but the player never became ready (partly blocked), switch to the plain iframe.
   setTimeout(() => { if (ytPlayers.get(el) === rec && !rec.ready) { try { rec.p.destroy(); } catch (_) {} ytPlayers.delete(el); const box = $('.ytbox', el); if (box && !$('.ythost', box)) { const h = document.createElement('div'); h.className = 'ythost'; box.prepend(h); } if (el === activeEl) mountRaw(el, it); } }, 6000);
+}
+// A YouTube clip that won't play here (removed, private, embedding off: codes 100/101/150) is skipped from now on.
+function ytUnavailable(el, it, code) {
+  S.badYT = S.badYT || {}; S.badYT[it.id] = code || 1; save();
+  el.classList.remove('ytpass'); hideHint(el);
+  showHint(el, 'This clip isn’t available · swipe for the next one');
 }
 function unmountYT(el) {
   const rec = ytPlayers.get(el); if (!rec) return; ytPlayers.delete(el);
@@ -438,7 +505,9 @@ function watchYT(el, rec) {
     try { rec.p.mute(); rec.p.playVideo(); } catch (_) {}
     setTimeout(() => {
       if (!rec.want || activeEl !== el) return; let s2 = -1; try { s2 = rec.p.getPlayerState(); } catch (_) {}
-      if (s2 !== 1 && s2 !== 3) { const c = $('.ytcover', el); if (c) c.classList.add('gone'); if (rec.p.raw && s2 !== -1) el.classList.add('ytpass'); }
+      // Still not playing: the browser wants a tap. The whole slide becomes the tap target (taps on the video reach
+      // YouTube's own player; taps elsewhere send play+unmute inside the gesture). Our poster stays; no extra button.
+      if (s2 !== 1 && s2 !== 3 && !rec.err) { el.classList.add('ytpass'); showHint(el, 'Tap to play'); }
     }, 2500);
   }, 2500);
 }
@@ -450,17 +519,36 @@ function ytPlay(el) {
 function ytPause(el) { const rec = ytPlayers.get(el); if (!rec) return; rec.want = false; clearTimeout(rec.t); if (rec.ready) try { rec.p.pauseVideo(); } catch (_) {} }
 
 // ---------- playback control ----------
+let stallT = null;
 function playFile(el, it) {
   const v = setVideoSrc(el, it, 'auto'); if (!v) return;
-  v.muted = !soundOn; v.dataset.user = '';
+  v.muted = !soundOn; userPaused = false;
+  // Stall watchdog: if a clip that is "playing" hasn't advanced after a few seconds (slow or stuck connection),
+  // retry it once, then fall back to its other source, without asking for a tap.
+  clearTimeout(stallT); let tries = 0;
+  const watch = () => { stallT = setTimeout(() => {
+    if (v._el !== el || el !== activeEl || userPaused || v.paused || v.currentTime > 0.2) return;
+    tries++;
+    if (tries === 1 || !(v._srcs && v._k < v._srcs.length)) v.load(); else v.src = v._srcs[v._k++].url;
+    v.play().catch(() => {});
+    if (tries < 3) watch(); else showHint(el, 'Slow connection · swipe for the next clip');
+  }, 6000); };
+  watch();
   const p = v.play();
-  if (p) p.catch(() => {
-    if (!v.muted) { v.muted = true; v.play().catch(() => ($('.playbig', el).hidden = false)); toast('Tap anywhere for sound'); }
-    else $('.playbig', el).hidden = false;
+  if (p) p.catch((err) => {
+    // Only NotAllowedError means the browser refused autoplay; Abort/NotSupported are load races handled elsewhere.
+    if (v._el !== activeEl || userPaused || (err && err.name !== 'NotAllowedError')) return;
+    if (!v.muted) { v.muted = true; v.play().catch((e2) => { if (!e2 || e2.name === 'NotAllowedError') autoplayBlocked(el); }); toast('Tap anywhere for sound'); }
+    else autoplayBlocked(el);
   });
 }
+// Muted inline autoplay refused (iOS Low Power Mode etc.): one tap anywhere starts it and unlocks every later clip.
+function autoplayBlocked(el) {
+  if (!autoplayStrict) { autoplayStrict = true; toast('Autoplay is paused on this phone (Low Power Mode?). Tap once and the rest play on their own.', 4200); }
+  showHint(el);
+}
 function pauseItem(el) { if (!el) return; const v = $('video', el); if (v) v.pause(); ytPause(el); }
-function pauseAll() { $$('#feed video').forEach((v) => v.pause()); for (const [el] of ytPlayers) ytPause(el); }
+function pauseAll() { vpool.forEach((v) => v.pause()); for (const [el] of ytPlayers) ytPause(el); }
 function playActive() { if (!activeEl) return; const it = feedItems[+activeEl.dataset.idx]; if (!it) return;
   if (it.kind === 'file') playFile(activeEl, it); else if (it.kind === 'youtube') ytPlay(activeEl); }
 let ytTick = null;
@@ -475,12 +563,14 @@ function activate(el) {
   if (activeEl) pauseItem(activeEl);
   activeEl = el;
   const idx = +el.dataset.idx; const it = feedItems[idx];
-  // Keep previous/current/next warm, unmount far items to save memory.
+  // Keep previous/current/next warm, unmount far items to save memory. The video pool serves current, next, previous.
+  const wantV = [idx, idx + 1, idx - 1].filter((i) => feedItems[i] && feedItems[i].kind === 'file');
+  for (const v of vpool) if (v._el && !wantV.includes(+v._el.dataset.idx)) releaseVideo(v);
   $$('#feed .item').forEach((x) => {
     const i = +x.dataset.idx; const d = i - idx; const xi = feedItems[i]; if (!xi) return;
     if (Math.abs(d) > DRY_FAR) { dehydrate(x); return; }
     if (Math.abs(d) <= HYDRATE_NEAR) hydrate(x, i);
-    if (xi.kind === 'file') { if (Math.abs(d) > 2) unloadVideo(x); else if (d !== 0) setVideoSrc(x, xi, d === 1 ? 'auto' : 'metadata'); }
+    if (xi.kind === 'file' && (d === 1 || d === -1)) setVideoSrc(x, xi, d === 1 ? 'auto' : 'metadata');
     if (xi.kind === 'youtube') { if (Math.abs(d) <= 1) mountYT(x, xi, { active: d === 0 }); else unmountYT(x); }
   });
   if (idx >= feedItems.length - REFILL_AT) {
@@ -489,18 +579,7 @@ function activate(el) {
   }
   if (!it) return;
   if (it.kind !== 'learn' && it.kind !== 'end') { S.seen[it.id] = Date.now(); save(); seenPut(it.id, S.seen[it.id]); }
-  if (it.kind === 'file') {
-    playFile(el, it);
-    const v = $('video', el);
-    if (!v.dataset.wired) {
-      v.dataset.wired = '1'; let counted = false;
-      v.addEventListener('timeupdate', () => {
-        const bar = $('.progress i', el); if (v.duration) bar.style.width = (100 * v.currentTime / v.duration) + '%';
-        if (!counted && v.currentTime > 3) { counted = true; trackRecent(it); }
-      });
-      v.addEventListener('playing', () => ($('.playbig', el).hidden = true));
-    }
-  }
+  if (it.kind === 'file') playFile(el, it);
   if (it.kind === 'youtube') { if (!online()) return; mountYT(el, it, { active: true }); ytPlay(el); trackYTProgress(el); }
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) pauseAll(); else if (!$('#view-feed').hidden && $('#nudge').hidden) playActive(); });
@@ -510,8 +589,8 @@ $('#feed').addEventListener('click', async (e) => {
   const el = e.target.closest('.item'); if (!el) return;
   const it = feedItems[+el.dataset.idx];
   const b = e.target.closest('button');
-  if (b?.classList.contains('like')) { S.likes[it.id] ? delete S.likes[it.id] : (S.likes[it.id] = Date.now()); save(); b.classList.toggle('liked', !!S.likes[it.id]); b.textContent = S.likes[it.id] ? '♥' : '♡'; return; }
-  if (b?.classList.contains('save')) { toggleSave(it); b.classList.toggle('on', !!S.saves[it.id]); b.textContent = S.saves[it.id] ? '★' : '☆'; return; }
+  if (b?.classList.contains('like')) { S.likes[it.id] ? delete S.likes[it.id] : (S.likes[it.id] = Date.now()); save(); b.classList.toggle('liked', !!S.likes[it.id]); b.textContent = S.likes[it.id] ? '♥' : '♡'; pop(b, !!S.likes[it.id]); return; }
+  if (b?.classList.contains('save')) { toggleSave(it); b.classList.toggle('on', !!S.saves[it.id]); b.textContent = S.saves[it.id] ? '★' : '☆'; pop(b, !!S.saves[it.id]); return; }
   if (b?.classList.contains('share')) { share(it); return; }
   if (b?.classList.contains('opt')) { answer(b); return; }
   if (b?.id === 'nextSet') { S.setIndex++; save(); buildFeed(); return; }
@@ -519,14 +598,16 @@ $('#feed').addEventListener('click', async (e) => {
   if ((it?.kind === 'youtube' || it?.kind === 'file') && !e.target.closest('.meta a, .rail')) {
     if (it.kind === 'youtube' && !online()) { toast('YouTube clips need internet'); return; }
     // First tap turns sound on (TikTok-style); after that a tap toggles pause/resume.
-    if (!soundOn || b?.classList.contains('playbig')) {
+    const v0 = $('video', el);
+    if (!soundOn || b?.classList.contains('playbig') || (v0 && (v0.muted || (v0.paused && !userPaused))) || el.classList.contains('ytpass')) {
       if (!soundOn) { setSound(true, { fromGesture: true }); flashIcon(el, '🔊'); }
-      const v = $('video', el); if (v) { v.muted = false; v.play().catch(() => { v.muted = true; v.play().catch(() => {}); }); }
+      hideHint(el); userPaused = false;
+      const v = v0; if (v) { v.muted = false; v.play().catch(() => { v.muted = true; v.play().catch(() => {}); }); }
       else { const rec = ytPlayers.get(el); if (rec && rec.ready) { rec.want = true; rec.p.unMute(); rec.p.playVideo(); } else if (rec) ytPlay(el); else mountYT(el, it, { active: true }); }
       $('.playbig', el).hidden = true; return;
     }
     const v = $('video', el);
-    if (v) { if (v.paused) { v.play().catch(() => {}); flashIcon(el, '▶'); } else { v.pause(); flashIcon(el, '❚❚'); } return; }
+    if (v) { if (v.paused) { userPaused = false; v.play().catch(() => {}); flashIcon(el, '▶'); } else { userPaused = true; v.pause(); flashIcon(el, '❚❚'); } return; }
     const rec = ytPlayers.get(el); if (!rec || !rec.ready) return;
     let st = -1; try { st = rec.p.getPlayerState(); } catch (_) {}
     if (st === 1 || st === 3) { ytPause(el); flashIcon(el, '❚❚'); } else { rec.want = true; rec.p.playVideo(); flashIcon(el, '▶'); }
@@ -667,12 +748,19 @@ $('#nudgeStop').onclick = () => { S.time.done = true; save(); $('#nudge').hidden
   toast('See you tomorrow. Your saved items are here.', 3500); };
 
 // ---------- connectivity ----------
+async function updateOfflineBar() {
+  const bar = $('#offlineBar'); if (!bar) return;
+  if (online()) { bar.hidden = true; return; }
+  const n = (await availableOffline()).size; const tips = CAT.items.filter((i) => i.kind === 'tip').length;
+  bar.textContent = `Offline · ${n} saved clip${n === 1 ? '' : 's'} + ${tips} tip cards. New clips download when you’re back online.`;
+  bar.hidden = false;
+}
 function updateOnline(rebuild) {
-  $('#offlineBadge').hidden = online();
+  $('#offlineBadge').hidden = online(); updateOfflineBar();
   if (rebuild) { activeEl = null; buildFeed(); }
 }
-window.addEventListener('online', () => { updateOnline(true); toast('Back online'); setTimeout(() => refreshContent(), 1500); });
-window.addEventListener('offline', () => { updateOnline(true); toast('Offline — showing downloaded clips and tip cards'); });
+window.addEventListener('online', () => { updateOnline(true); toast('Back online · fetching fresh clips'); setTimeout(() => refreshContent(), 1500); });
+window.addEventListener('offline', () => { updateOnline(true); toast('Offline · playing your saved clips and tip cards'); });
 
 // ---------- fresh content: pull new items when online, keep them for offline ----------
 const FRESH_DB = 'lumen-fresh';
@@ -895,15 +983,53 @@ function onboard() {
     $('#onboard').hidden = false;
     const go = $('#onboardGo');
     topicChips($('#onboardTopics'), () => (go.disabled = S.topics.length === 0));
-    go.onclick = () => { $('#onboard').hidden = true; resolve(); };
+    go.onclick = () => { unlockMedia(); $('#onboard').hidden = true; resolve(); };
   });
 }
 
 // ---------- boot ----------
+// ---------- updates: a waiting service worker shows "Update available, tap to refresh" ----------
+const bootAt = Date.now(); let interacted = false; let swReg = null; let waitingSW = null;
+['pointerdown', 'touchstart', 'keydown'].forEach((t) => document.addEventListener(t, () => (interacted = true), { once: true, passive: true, capture: true }));
+function setVerStatus(txt) { const e = $('#verStatus'); if (e) e.textContent = txt; }
+function offerUpdate(w) {
+  if (!w) return; waitingSW = w;
+  // Right after opening (nothing touched yet) just apply it; mid-session, ask first so nothing gets interrupted.
+  if (!interacted && Date.now() - bootAt < 8000) { w.postMessage('SKIP_WAITING'); return; }
+  $('#updToast').hidden = false; setVerStatus('Update available — tap the banner or the button below');
+  const b = $('#checkUpd'); if (b) b.textContent = 'Update now';
+}
+function applyUpdate() { if (waitingSW) { $('#updToast').textContent = 'Updating…'; waitingSW.postMessage('SKIP_WAITING'); setTimeout(() => location.reload(), 4000); } else location.reload(); }
+async function checkUpdate(manual) {
+  if (waitingSW) return applyUpdate();
+  if (!swReg) { if (manual) toast('Updates need the installed app to be online'); return; }
+  if (manual) setVerStatus('Checking…');
+  try { await swReg.update(); } catch (_) {}
+  setTimeout(() => { if (!waitingSW && !swReg.installing) setVerStatus(online() ? 'Up to date' : 'Offline — will check when you’re back online'); }, manual ? 2500 : 0);
+}
+async function registerSW() {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    const reg = swReg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' });
+    const watch = (n) => n && n.addEventListener('statechange', () => { if (n.state === 'installed' && navigator.serviceWorker.controller) offerUpdate(n); });
+    if (reg.waiting && navigator.serviceWorker.controller) offerUpdate(reg.waiting);
+    watch(reg.installing); reg.addEventListener('updatefound', () => watch(reg.installing));
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (waitingSW && !reloaded) { reloaded = true; location.reload(); } });
+    reg.update().catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+    setInterval(() => reg.update().catch(() => {}), 20 * 60 * 1000);
+    checkUpdate(false);
+  } catch (e) { console.warn('SW', e); }
+}
+$('#updToast').addEventListener('click', applyUpdate);
+$('#checkUpd').addEventListener('click', () => checkUpdate(true));
+
 async function boot() {
-  if ('serviceWorker' in navigator) { try { const reg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }); reg.update().catch(() => {}); } catch (e) { console.warn('SW', e); } }
-  const ver = $('#appVer'); if (ver) ver.textContent = 'v' + APP_VERSION;
-  try { CAT = await (await fetch('data/catalog.json')).json(); } catch (_) { CAT = { topics: [], items: [] }; }
+  const catP = fetch('data/catalog.json').then((r) => r.json()).catch(() => ({ topics: [], items: [] }));
+  $$('#appVer, .appVer2').forEach((e) => (e.textContent = 'v' + APP_VERSION));
+  registerSW();
+  CAT = await catP;
   byId = new Map(CAT.items.map((i) => [i.id, i]));
   await loadFresh();
   await seenLoad();
@@ -913,7 +1039,8 @@ async function boot() {
   updateOnline(false); updateTimer();
   if (!S.topics.length) await onboard();
   await buildFeed();
-  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, ytLog: () => ytLog, ytApiFailed: () => ytApiFailed, version: APP_VERSION, seenLoad, appendBatch, fresh: () => CAT.items.filter((i) => i.fresh) };
+  $('#bootSkel')?.remove();
+  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, ytLog: () => ytLog, ytApiFailed: () => ytApiFailed, version: APP_VERSION, pool: () => vpool, vlog: () => vlog, strict: () => autoplayStrict, applyUpdate, checkUpdate, seenLoad, appendBatch, fresh: () => CAT.items.filter((i) => i.fresh) };
   setTimeout(() => refreshContent(), 2000);
 }
 boot();

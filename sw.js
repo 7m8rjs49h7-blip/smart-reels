@@ -1,5 +1,5 @@
 /* Lumen service worker: app shell, catalog, thumbnails, and range-capable offline video. */
-const VERSION = 'v1.4.1';
+const VERSION = 'v1.5.0';
 const SHELL = 'lumen-shell-' + VERSION;
 const DATA = 'lumen-data';
 const IMG = 'lumen-img';
@@ -14,20 +14,31 @@ self.addEventListener('install', (e) => {
     await c.addAll(SHELL_FILES.map((u) => new Request(u, { cache: 'reload' })));
     const d = await caches.open(DATA);
     try { await d.add(new Request('data/catalog.json', { cache: 'reload' })); } catch (_) {}
-    await self.skipWaiting();
+    // Pages from v1.4.x and older can't show the "Update available" banner, so replace them right away.
+    // From v1.5.0 on, the page decides: it applies the update at launch, or asks first if you're mid-session.
+    const legacy = (await caches.keys()).some((k) => /^lumen-shell-v1\.[0-4]\./.test(k));
+    if (legacy) await self.skipWaiting();
   })());
 });
+self.addEventListener('message', (e) => { if (e.data === 'SKIP_WAITING') self.skipWaiting(); });
 
 self.addEventListener('activate', (e) => {
-  e.waitUntil((async () => {
+  const done = (async () => {
     let upgraded = false;
     for (const k of await caches.keys()) {
       if (k.startsWith('lumen-shell-') && k !== SHELL) { await caches.delete(k); upgraded = true; }
     }
     await self.clients.claim();
-    // On an upgrade, reload open pages so they run the new code right away (even pages from older versions).
-    if (upgraded) for (const c of await self.clients.matchAll({ type: 'window' })) { try { await c.navigate(c.url); } catch (_) {} }
-  })());
+    return upgraded;
+  })();
+  e.waitUntil(done);
+  // On an upgrade, reload open pages so they run the new code right away (even pages from older versions).
+  // This must happen AFTER activation finishes: a reload awaited inside activate waits for this same worker to
+  // activate, so it deadlocks (v1.4.0/v1.4.1 did that and could leave a phone stuck on an old copy).
+  done.then(async (upgraded) => {
+    if (!upgraded) return;
+    for (const c of await self.clients.matchAll({ type: 'window' })) { try { c.navigate(c.url); } catch (_) {} }
+  });
 });
 
 function parseRange(h, size) {
