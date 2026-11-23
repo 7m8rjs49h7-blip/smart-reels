@@ -122,3 +122,4 @@ select{width:100%;padding:11px;border-radius:12px;background:var(--card2);color:
 .rail{right:10px;bottom:20px}
 .progress{height:2px;background:#ffffff1f}
 .progress i{transition:width .35s linear}
+.item.ytpass .tapzone{pointer-events:none}

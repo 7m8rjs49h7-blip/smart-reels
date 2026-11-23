@@ -6,7 +6,8 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const KEY = 'lumen.v1';
 const MEDIA_CACHE = 'lumen-media';
 const RECENT_MAX = 20;
-const SET_SIZE = 36; // items per finite "set" — no infinite scroll
+const SET_SIZE = 36;
+const APP_VERSION = '1.4.0'; // items per finite "set" — no infinite scroll
 
 const defaults = { topics: [], likes: {}, saves: {}, seen: {}, recent: [], media: {}, packs: {},
   settings: { limit: 30, recap: 5, cap: 500, autoRecent: true, wifiOnly: false },
@@ -126,11 +127,15 @@ async function buildFeed(startId) {
   const rnd = seeded([...today()].reduce((a, c) => a * 31 + c.charCodeAt(0), 7) + S.setIndex * 977);
   const unseen = (l) => l.filter((x) => !S.seen[x.id]); const seen = (l) => l.filter((x) => S.seen[x.id]);
   const vids = pool.filter((i) => i.kind !== 'tip'); const tips = pool.filter((i) => i.kind === 'tip');
-  const order = (l) => [...interleaveTopics(shuffle(unseen(l), rnd), rnd), ...interleaveTopics(shuffle(seen(l), rnd), rnd)];
+  const oldest = (l) => seen(l).sort((a, b) => S.seen[a.id] - S.seen[b.id]);
+  const order = (l) => [...interleaveTopics(shuffle(unseen(l), rnd), rnd), ...interleaveTopics(oldest(l), rnd)];
+  // Mix formats: weave Commons/local video files between YouTube clips so the feed alternates styles.
+  const weave = (l) => { const f = l.filter((x) => x.kind === 'file'), y = l.filter((x) => x.kind !== 'file'); const out = [];
+    while (f.length || y.length) { if (y.length) out.push(y.shift()); if (f.length) out.push(f.shift()); if (y.length) out.push(y.shift()); } return out; };
   // Prefer liked topics slightly
   const liked = new Set(Object.keys(S.likes).map((id) => byId.get(id)?.topic).filter(Boolean));
   const boost = (l) => l.sort((a, b) => (liked.has(b.topic) && !S.seen[b.id]) - (liked.has(a.topic) && !S.seen[a.id]));
-  const V = boost(order(vids)), T = order(tips);
+  const V = weave(boost(order(vids))), T = order(tips);
   const merged = []; let vi = 0, ti = 0;
   while (merged.length < SET_SIZE && (vi < V.length || ti < T.length)) {
     if (vi < V.length) merged.push(V[vi++]); if (merged.length >= SET_SIZE) break;
@@ -168,7 +173,9 @@ function metaHTML(it) {
     <span class="topic">${t.emoji} ${esc(t.label)}${it.fresh && !S.seen[it.id] ? ' <span class="newb">New</span>' : ''}</span>
     <h2>${esc(it.title)}</h2>
     ${it.takeaway ? `<p class="take">${esc(it.takeaway)}</p>` : ''}
-    <div class="credit">${esc(it.credit || '')} · <a href="${esc(it.sourceUrl)}" target="_blank" rel="noopener">${esc(it.sourceName)}</a> · ${lic}</div>
+    <div class="credit">${it.kind === 'youtube'
+      ? `<a href="${esc(it.sourceUrl)}" target="_blank" rel="noopener">${esc(it.sourceName || 'YouTube')}</a>`
+      : `${esc(it.credit || '')} · <a href="${esc(it.sourceUrl)}" target="_blank" rel="noopener">${esc(it.sourceName)}</a> · ${lic}`}</div>
   </div>`;
 }
 function itemHTML(it, idx) {
@@ -269,36 +276,106 @@ function flashIcon(el, txt) { const t = $('.tapicon', el); if (!t) return; t.tex
 // ---------- YouTube IFrame API (youtube-nocookie) ----------
 const ytPlayers = new Map(); // article element -> { p, ready, want }
 let ytApi = null;
+let ytApiFailed = false; // e.g. Brave Shields / content blockers block youtube.com/iframe_api or www-widgetapi
+const YT_API_TIMEOUT = 4000;
 function loadYT() {
+  if (ytApiFailed) return Promise.resolve(null);
   if (ytApi) return ytApi;
   ytApi = new Promise((res) => {
     if (window.YT && window.YT.Player) return res(window.YT);
+    const done = (v) => { clearTimeout(to); if (!v) { ytApiFailed = true; } res(v); };
+    const to = setTimeout(() => done(null), YT_API_TIMEOUT);
     const prev = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => { if (prev) try { prev(); } catch (_) {} res(window.YT); };
+    window.onYouTubeIframeAPIReady = () => { if (prev) try { prev(); } catch (_) {} done(window.YT); };
     const sc = document.createElement('script'); sc.src = 'https://www.youtube.com/iframe_api'; sc.async = true;
-    sc.onerror = () => { ytApi = null; res(null); }; document.head.appendChild(sc);
+    sc.onerror = () => done(null); document.head.appendChild(sc);
   });
   return ytApi;
 }
+// ---- API-free fallback: plain youtube-nocookie iframe driven by postMessage commands ----
+const YT_ORIGIN = 'https://www.youtube-nocookie.com';
+const ytLog = []; // commands sent (for tests / debugging)
+function rawSrc(id) {
+  const q = new URLSearchParams({ autoplay: '1', mute: '1', playsinline: '1', controls: '0', rel: '0', modestbranding: '1', loop: '1', playlist: id,
+    enablejsapi: '1', iv_load_policy: '3', fs: '0', disablekb: '1', hl: 'en', origin: location.origin });
+  return `${YT_ORIGIN}/embed/${encodeURIComponent(id)}?${q}`;
+}
+function rawPlayer(el, it, rec, onState) {
+  const host = $('.ythost', el); const f = document.createElement('iframe');
+  f.className = 'ytraw'; f.src = rawSrc(it.youtubeId); f.title = it.title;
+  f.setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture'); f.setAttribute('playsinline', '');
+  f.setAttribute('frameborder', '0');
+  if (host) host.replaceWith(f); else $('.ytbox', el).prepend(f);
+  const st = { ps: -1, t: 0, d: 0 };
+  const send = (func, args = []) => { ytLog.push({ id: it.id, func, t: Date.now() }); try { f.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args, id: it.id, channel: 'widget' }), YT_ORIGIN); } catch (_) {} };
+  const p = {
+    raw: true, getIframe: () => f,
+    playVideo: () => send('playVideo'), pauseVideo: () => send('pauseVideo'), mute: () => send('mute'), unMute: () => send('unMute'),
+    seekTo: (s) => send('seekTo', [s, true]), getPlayerState: () => st.ps, getCurrentTime: () => st.t, getDuration: () => st.d,
+    destroy: () => f.remove(),
+    _msg: (d) => {
+      if (d.event === 'onReady') { rec.ready = true; afterReady(); }
+      const info = d.info; if (info == null) return;
+      if (d.event === 'onStateChange' && typeof info === 'number') { st.ps = info; onState(info); }
+      if (typeof info === 'object') {
+        if (typeof info.playerState === 'number' && info.playerState !== st.ps) { st.ps = info.playerState; onState(st.ps); }
+        if (typeof info.currentTime === 'number') st.t = info.currentTime; if (typeof info.duration === 'number') st.d = info.duration;
+      }
+    },
+  };
+  const afterReady = () => { if (rec._readyDone) return; rec._readyDone = true; rec.ready = true; soundOn ? p.unMute() : p.mute(); if (rec.want) p.playVideo(); else p.pauseVideo(); };
+  f.addEventListener('load', () => {
+    const hello = () => { try { f.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: it.id, channel: 'widget' }), YT_ORIGIN); } catch (_) {} };
+    hello(); setTimeout(hello, 400); setTimeout(hello, 1200);
+    // Even if the player never answers (no messages), treat it as ready so commands are still sent.
+    setTimeout(afterReady, 1500);
+    // Our thumbnail never sits on top of a live player: reveal YouTube's own frame shortly after load.
+    setTimeout(() => { const c = $('.ytcover', el); if (c) c.classList.add('gone'); }, 1800);
+  });
+  return p;
+}
+window.addEventListener('message', (e) => {
+  if (!/^https:\/\/www\.youtube(-nocookie)?\.com$/.test(e.origin)) return;
+  let d = e.data; if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) { return; } }
+  if (!d || typeof d !== 'object') return;
+  for (const [, rec] of ytPlayers) if (rec.p && rec.p.raw && rec.p.getIframe().contentWindow === e.source) { rec.p._msg(d); break; }
+});
+function ytStateHandler(el, rec) {
+  return (state) => {
+    const cover = $('.ytcover', el);
+    if (state === 1) { if (cover) cover.classList.add('gone'); $('.playbig', el).hidden = true; el.classList.remove('ytpass'); if (!rec.want) rec.p.pauseVideo(); }
+    if (state === 0 && !rec.p.raw) { rec.p.seekTo(0, true); rec.p.playVideo(); } // loop (raw iframe loops via playlist=ID)
+  };
+}
+function mountRaw(el, it) {
+  const old = ytPlayers.get(el); if (old && old.p) { try { old.p.destroy(); } catch (_) {} }
+  const rec = { p: null, ready: false, want: el === activeEl, raw: true }; ytPlayers.set(el, rec);
+  rec.p = rawPlayer(el, it, rec, ytStateHandler(el, rec));
+  if (rec.want) watchYT(el, rec);
+  return rec;
+}
 const YT_VARS = (id) => ({ autoplay: 0, playsinline: 1, mute: 1, controls: 0, rel: 0, modestbranding: 1, iv_load_policy: 3, fs: 0, disablekb: 1, loop: 1, playlist: id, cc_load_policy: 0, hl: 'en', enablejsapi: 1, origin: location.origin });
-async function mountYT(el, it) {
-  if (ytPlayers.has(el) || !online()) return;
+async function mountYT(el, it, { active = false } = {}) {
+  if (!online()) return;
+  if (ytPlayers.has(el)) return;
+  // Without the API, only the active slide gets an (autoplaying) iframe.
+  if (ytApiFailed) { if (active) mountRaw(el, it); return; }
   const rec = { p: null, ready: false, want: false }; ytPlayers.set(el, rec);
-  const YT = await loadYT(); if (!YT || ytPlayers.get(el) !== rec) return;
+  const YT = await loadYT(); if (ytPlayers.get(el) !== rec) return;
+  if (!YT) { ytPlayers.delete(el); if (el === activeEl) mountRaw(el, it); return; }
   const host = $('.ythost', el); if (!host) return;
+  const onState = ytStateHandler(el, rec);
   rec.p = new YT.Player(host, {
-    host: 'https://www.youtube-nocookie.com', videoId: it.youtubeId, width: '100%', height: '100%', playerVars: YT_VARS(it.youtubeId),
+    host: YT_ORIGIN, videoId: it.youtubeId, width: '100%', height: '100%', playerVars: YT_VARS(it.youtubeId),
     events: {
       onReady: () => { rec.ready = true; const f = rec.p.getIframe && rec.p.getIframe(); if (f) { f.setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture'); f.title = it.title; }
         if (soundOn) rec.p.unMute(); else rec.p.mute(); if (rec.want) ytPlay(el); },
-      onStateChange: (e) => {
-        const cover = $('.ytcover', el);
-        if (e.data === 1) { if (cover) cover.classList.add('gone'); $('.playbig', el).hidden = true; if (!rec.want) rec.p.pauseVideo(); }
-        if (e.data === 0) { rec.p.seekTo(0, true); rec.p.playVideo(); } // loop
-      },
-      onError: () => { $('.playbig', el).hidden = true; const c = $('.ytcover', el); if (c) c.classList.add('err'); },
+      onStateChange: (e) => onState(e.data),
+      onError: () => { const c = $('.ytcover', el); if (c) c.classList.add('gone'); },
     },
   });
+  // If the API loaded but the player never became ready (partly blocked), switch to the plain iframe.
+  setTimeout(() => { if (ytPlayers.get(el) === rec && !rec.ready) { try { rec.p.destroy(); } catch (_) {} ytPlayers.delete(el); const box = $('.ytbox', el); if (box && !$('.ythost', box)) { const h = document.createElement('div'); h.className = 'ythost'; box.prepend(h); } if (el === activeEl) mountRaw(el, it); } }, 6000);
 }
 function unmountYT(el) {
   const rec = ytPlayers.get(el); if (!rec) return; ytPlayers.delete(el);
@@ -306,15 +383,21 @@ function unmountYT(el) {
   const box = $('.ytbox', el); if (box && !$('.ythost', box)) { const h = document.createElement('div'); h.className = 'ythost'; box.prepend(h); }
   const c = $('.ytcover', el); if (c) c.classList.remove('gone');
 }
+function watchYT(el, rec) {
+  clearTimeout(rec.t); rec.t = setTimeout(() => {
+    if (!rec.want || activeEl !== el) return; let st = -1; try { st = rec.p.getPlayerState(); } catch (_) {}
+    if (st === 1 || st === 3) return;
+    try { rec.p.mute(); rec.p.playVideo(); } catch (_) {}
+    setTimeout(() => {
+      if (!rec.want || activeEl !== el) return; let s2 = -1; try { s2 = rec.p.getPlayerState(); } catch (_) {}
+      if (s2 !== 1 && s2 !== 3) { const c = $('.ytcover', el); if (c) c.classList.add('gone'); if (rec.p.raw && s2 !== -1) el.classList.add('ytpass'); }
+    }, 2500);
+  }, 2500);
+}
 function ytPlay(el) {
   const rec = ytPlayers.get(el); if (!rec) return; rec.want = true; if (!rec.ready) return;
   try { if (soundOn) rec.p.unMute(); else rec.p.mute(); rec.p.playVideo(); } catch (_) {}
-  // If WebKit refuses to start with sound, fall back to muted autoplay.
-  clearTimeout(rec.t); rec.t = setTimeout(() => {
-    if (!rec.want || !rec.ready) return; let st = -1; try { st = rec.p.getPlayerState(); } catch (_) {}
-    if (st !== 1 && st !== 3) { try { rec.p.mute(); rec.p.playVideo(); } catch (_) {}
-      setTimeout(() => { let s2 = -1; try { s2 = rec.p.getPlayerState(); } catch (_) {} if (rec.want && s2 !== 1 && s2 !== 3) $('.playbig', el).hidden = false; }, 2500); }
-  }, 2500);
+  watchYT(el, rec);
 }
 function ytPause(el) { const rec = ytPlayers.get(el); if (!rec) return; rec.want = false; clearTimeout(rec.t); if (rec.ready) try { rec.p.pauseVideo(); } catch (_) {} }
 
@@ -348,10 +431,10 @@ function activate(el) {
   $$('#feed .item').forEach((x) => {
     const i = +x.dataset.idx; const d = i - idx; const xi = feedItems[i]; if (!xi) return;
     if (xi.kind === 'file') { if (Math.abs(d) > 2) unloadVideo(x); else if (d !== 0) setVideoSrc(x, xi, d === 1 ? 'auto' : 'metadata'); }
-    if (xi.kind === 'youtube') { if (Math.abs(d) <= 1) mountYT(x, xi); else unmountYT(x); }
+    if (xi.kind === 'youtube') { if (Math.abs(d) <= 1) mountYT(x, xi, { active: d === 0 }); else unmountYT(x); }
   });
   if (!it) return;
-  if (it.kind !== 'learn' && it.kind !== 'end') { S.seen[it.id] = Date.now(); save(); }
+  if (it.kind !== 'learn' && it.kind !== 'end') { S.seen[it.id] = Date.now(); save(); seenPut(it.id, S.seen[it.id]); }
   if (it.kind === 'file') {
     playFile(el, it);
     const v = $('video', el);
@@ -364,7 +447,7 @@ function activate(el) {
       v.addEventListener('playing', () => ($('.playbig', el).hidden = true));
     }
   }
-  if (it.kind === 'youtube') { if (!online()) return; mountYT(el, it); ytPlay(el); trackYTProgress(el); }
+  if (it.kind === 'youtube') { if (!online()) return; mountYT(el, it, { active: true }); ytPlay(el); trackYTProgress(el); }
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) pauseAll(); else if (!$('#view-feed').hidden && $('#nudge').hidden) playActive(); });
 
@@ -385,7 +468,7 @@ $('#feed').addEventListener('click', async (e) => {
     if (!soundOn || b?.classList.contains('playbig')) {
       if (!soundOn) { setSound(true, { fromGesture: true }); flashIcon(el, '🔊'); }
       const v = $('video', el); if (v) { v.muted = false; v.play().catch(() => { v.muted = true; v.play().catch(() => {}); }); }
-      else { const rec = ytPlayers.get(el); if (rec && rec.ready) { rec.want = true; rec.p.unMute(); rec.p.playVideo(); } else ytPlay(el); }
+      else { const rec = ytPlayers.get(el); if (rec && rec.ready) { rec.want = true; rec.p.unMute(); rec.p.playVideo(); } else if (rec) ytPlay(el); else mountYT(el, it, { active: true }); }
       $('.playbig', el).hidden = true; return;
     }
     const v = $('video', el);
@@ -585,14 +668,24 @@ let freshBusy = null;
 
 function idb() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open(FRESH_DB, 1);
-    r.onupgradeneeded = () => r.result.createObjectStore('items', { keyPath: 'id' });
+    const r = indexedDB.open(FRESH_DB, 2);
+    r.onupgradeneeded = () => { const db = r.result;
+      if (!db.objectStoreNames.contains('items')) db.createObjectStore('items', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('seen')) db.createObjectStore('seen', { keyPath: 'id' }); };
     r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
   });
 }
 async function idbAll() {
   try { const db = await idb(); return await new Promise((res) => { const q = db.transaction('items').objectStore('items').getAll(); q.onsuccess = () => res(q.result || []); q.onerror = () => res([]); }); }
   catch (_) { return []; }
+}
+async function seenPut(id, ts) { try { const db = await idb(); db.transaction('seen', 'readwrite').objectStore('seen').put({ id, ts }); } catch (_) {} }
+async function seenLoad() {
+  try { const db = await idb(); const rows = await new Promise((res) => { const q = db.transaction('seen').objectStore('seen').getAll(); q.onsuccess = () => res(q.result || []); q.onerror = () => res([]); });
+    for (const r of rows) if (!S.seen[r.id] || S.seen[r.id] < r.ts) S.seen[r.id] = r.ts;
+    // Seed IndexedDB from older installs that only kept seen IDs in localStorage.
+    if (!rows.length && Object.keys(S.seen).length) { const tx = db.transaction('seen', 'readwrite'); const st = tx.objectStore('seen'); for (const [id, ts] of Object.entries(S.seen)) st.put({ id, ts }); }
+    return rows.length; } catch (_) { return 0; }
 }
 async function idbPut(items) {
   if (!items.length) return; const db = await idb();
@@ -754,17 +847,19 @@ function onboard() {
 
 // ---------- boot ----------
 async function boot() {
-  if ('serviceWorker' in navigator) { try { await navigator.serviceWorker.register('sw.js'); } catch (e) { console.warn('SW', e); } }
+  if ('serviceWorker' in navigator) { try { const reg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }); reg.update().catch(() => {}); } catch (e) { console.warn('SW', e); } }
+  const ver = $('#appVer'); if (ver) ver.textContent = 'v' + APP_VERSION;
   try { CAT = await (await fetch('data/catalog.json')).json(); } catch (_) { CAT = { topics: [], items: [] }; }
   byId = new Map(CAT.items.map((i) => [i.id, i]));
   await loadFresh();
+  await seenLoad();
   // Reconcile media index with the actual cache (e.g. if the browser evicted storage)
   try { const c = await caches.open(MEDIA_CACHE); const keys = new Set((await c.keys()).map((r) => r.url));
     for (const url of Object.keys(S.media)) if (!keys.has(url)) delete S.media[url]; save(); } catch (_) {}
   updateOnline(false); updateTimer();
   if (!S.topics.length) await onboard();
   await buildFeed();
-  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, fresh: () => CAT.items.filter((i) => i.fresh) };
+  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, ytLog: () => ytLog, ytApiFailed: () => ytApiFailed, version: APP_VERSION, seenLoad, fresh: () => CAT.items.filter((i) => i.fresh) };
   setTimeout(() => refreshContent(), 2000);
 }
 boot();

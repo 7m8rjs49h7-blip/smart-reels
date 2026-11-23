@@ -1,5 +1,5 @@
 /* Lumen service worker: app shell, catalog, thumbnails, and range-capable offline video. */
-const VERSION = 'v1.3.0';
+const VERSION = 'v1.4.0';
 const SHELL = 'lumen-shell-' + VERSION;
 const DATA = 'lumen-data';
 const IMG = 'lumen-img';
@@ -10,19 +10,23 @@ const SHELL_FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webma
 self.addEventListener('install', (e) => {
   e.waitUntil((async () => {
     const c = await caches.open(SHELL);
-    await c.addAll(SHELL_FILES);
+    // cache: 'reload' bypasses the HTTP cache (GitHub Pages sends max-age=600) so a new version never caches old files.
+    await c.addAll(SHELL_FILES.map((u) => new Request(u, { cache: 'reload' })));
     const d = await caches.open(DATA);
-    try { await d.add('data/catalog.json'); } catch (_) {}
+    try { await d.add(new Request('data/catalog.json', { cache: 'reload' })); } catch (_) {}
     await self.skipWaiting();
   })());
 });
 
 self.addEventListener('activate', (e) => {
   e.waitUntil((async () => {
+    let upgraded = false;
     for (const k of await caches.keys()) {
-      if (k.startsWith('lumen-shell-') && k !== SHELL) await caches.delete(k);
+      if (k.startsWith('lumen-shell-') && k !== SHELL) { await caches.delete(k); upgraded = true; }
     }
     await self.clients.claim();
+    // On an upgrade, reload open pages so they run the new code right away (even pages from older versions).
+    if (upgraded) for (const c of await self.clients.matchAll({ type: 'window' })) { try { await c.navigate(c.url); } catch (_) {} }
   })());
 });
 
@@ -112,12 +116,15 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // App shell: stale-while-revalidate; navigations fall back to cached index.
+  // App shell: network-first (revalidated, 3 s timeout) so updates show on the next open; cache when offline.
   e.respondWith((async () => {
     const c = await caches.open(SHELL);
     const key = req.mode === 'navigate' ? 'index.html' : req;
+    const net = fetch(req, { cache: 'no-cache' }).then((res) => { if (res.ok) c.put(key, res.clone()); return res; }).catch(() => null);
+    const timeout = new Promise((r) => setTimeout(() => r(null), 3000));
+    const res = await Promise.race([net, timeout]);
+    if (res) return res;
     const hit = await c.match(key, { ignoreSearch: req.mode === 'navigate' });
-    const net = fetch(req).then((res) => { if (res.ok) c.put(key, res.clone()); return res; }).catch(() => null);
     return hit || (await net) || new Response('Offline', { status: 503 });
   })());
 });
