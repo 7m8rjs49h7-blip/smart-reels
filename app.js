@@ -7,7 +7,10 @@ const KEY = 'lumen.v1';
 const MEDIA_CACHE = 'lumen-media';
 const RECENT_MAX = 20;
 const SET_SIZE = 36;
-const APP_VERSION = '1.4.0'; // items per finite "set" — no infinite scroll
+const APP_VERSION = '1.4.1';
+const REFILL_AT = 5;      // append the next batch when this close to the end
+const NO_REPEAT = 30;     // don't repeat any of the last ~30 items
+const HYDRATE_NEAR = 6, DRY_FAR = 12; // keep DOM bounded: only slides near the viewer hold real content // items per finite "set" — no infinite scroll
 
 const defaults = { topics: [], likes: {}, saves: {}, seen: {}, recent: [], media: {}, packs: {},
   settings: { limit: 30, recap: 5, cap: 500, autoRecent: true, wifiOnly: false },
@@ -118,40 +121,85 @@ async function availableOffline() {
   for (const it of CAT.items) { if (it.kind !== 'file') continue; const s = pickSource(it); if (s && S.media[s.url] && await isCached(s.url)) set.add(it.id); }
   return set;
 }
-async function buildFeed(startId) {
+async function feedPool() {
   const sel = new Set(S.topics.length ? S.topics : CAT.topics.map((t) => t.id));
   let pool = CAT.items.filter((it) => sel.has(it.topic));
   const off = !online();
   if (off) { const cached = await availableOffline(); pool = pool.filter((it) => it.kind === 'tip' || cached.has(it.id)); }
   else pool = pool.filter((it) => it.kind !== 'file' || pickSource(it));
-  const rnd = seeded([...today()].reduce((a, c) => a * 31 + c.charCodeAt(0), 7) + S.setIndex * 977);
-  const unseen = (l) => l.filter((x) => !S.seen[x.id]); const seen = (l) => l.filter((x) => S.seen[x.id]);
-  const vids = pool.filter((i) => i.kind !== 'tip'); const tips = pool.filter((i) => i.kind === 'tip');
-  const oldest = (l) => seen(l).sort((a, b) => S.seen[a.id] - S.seen[b.id]);
+  return { pool, off };
+}
+// One batch: unseen first (shuffled, categories interleaved), then the least-recently-seen in a fresh order; formats mixed.
+function nextBatch(pool, off, rnd, exclude) {
+  const avail = pool.filter((x) => !exclude.has(x.id));
+  const unseen = (l) => l.filter((x) => !S.seen[x.id]);
+  const oldest = (l) => { const s2 = l.filter((x) => S.seen[x.id]).sort((a, b) => S.seen[a.id] - S.seen[b.id]); return shuffle(s2.slice(0, Math.max(SET_SIZE * 2, Math.ceil(s2.length / 2))), rnd).concat(s2.slice(Math.max(SET_SIZE * 2, Math.ceil(s2.length / 2)))); };
   const order = (l) => [...interleaveTopics(shuffle(unseen(l), rnd), rnd), ...interleaveTopics(oldest(l), rnd)];
-  // Mix formats: weave Commons/local video files between YouTube clips so the feed alternates styles.
   const weave = (l) => { const f = l.filter((x) => x.kind === 'file'), y = l.filter((x) => x.kind !== 'file'); const out = [];
     while (f.length || y.length) { if (y.length) out.push(y.shift()); if (f.length) out.push(f.shift()); if (y.length) out.push(y.shift()); } return out; };
-  // Prefer liked topics slightly
   const liked = new Set(Object.keys(S.likes).map((id) => byId.get(id)?.topic).filter(Boolean));
   const boost = (l) => l.sort((a, b) => (liked.has(b.topic) && !S.seen[b.id]) - (liked.has(a.topic) && !S.seen[a.id]));
-  const V = weave(boost(order(vids))), T = order(tips);
+  const V = weave(boost(order(avail.filter((i) => i.kind !== 'tip')))), T = order(avail.filter((i) => i.kind === 'tip'));
   const merged = []; let vi = 0, ti = 0;
   while (merged.length < SET_SIZE && (vi < V.length || ti < T.length)) {
     if (vi < V.length) merged.push(V[vi++]); if (merged.length >= SET_SIZE) break;
     if (vi < V.length && !off) merged.push(V[vi++]); if (merged.length >= SET_SIZE) break;
     if (ti < T.length) merged.push(T[ti++]);
   }
-  if (startId) { const it = byId.get(startId); if (it) { const i = merged.findIndex((x) => x.id === startId); if (i >= 0) merged.splice(i, 1); merged.unshift(it); } }
-  // Insert recap cards
-  const out = []; const n = +S.settings.recap; let since = [];
-  for (const it of merged) {
-    out.push(it); since.push(it);
-    if (n && since.length >= n) { out.push({ kind: 'learn', id: 'learn-' + out.length, from: since.map((x) => x.id) }); since = []; }
+  return merged;
+}
+let recapSince = []; let learnSeq = 0;
+function withRecaps(list) {
+  const out = []; const n = +S.settings.recap;
+  for (const it of list) {
+    out.push(it); recapSince.push(it);
+    if (n && recapSince.length >= n) { out.push({ kind: 'learn', id: 'learn-' + (++learnSeq), from: recapSince.map((x) => x.id) }); recapSince = []; }
   }
-  out.push({ kind: 'end', id: 'end' });
-  feedItems = out;
+  return out;
+}
+async function buildFeed(startId) {
+  const { pool, off } = await feedPool();
+  const rnd = seeded([...today()].reduce((a, c) => a * 31 + c.charCodeAt(0), 7) + S.setIndex * 977);
+  const merged = nextBatch(pool, off, rnd, new Set());
+  if (startId) { const it = byId.get(startId); if (it) { const i = merged.findIndex((x) => x.id === startId); if (i >= 0) merged.splice(i, 1); merged.unshift(it); } }
+  recapSince = [];
+  feedItems = withRecaps(merged);
   renderFeed(off);
+}
+// Endless feed: append the next rotated batch near the end without touching the slides already on screen.
+let appending = null;
+function appendBatch() {
+  if (appending) return appending;
+  appending = (async () => {
+    const { pool, off } = await feedPool();
+    const media = feedItems.filter((x) => x.kind !== 'learn' && x.kind !== 'end');
+    if (!media.length || !pool.length) return 0;
+    const cur = activeEl ? +activeEl.dataset.idx : 0;
+    // Never repeat anything still queued after the viewer, or any of the last ~30 shown.
+    const queued = feedItems.slice(cur + 1).filter((x) => x.kind !== 'learn').map((x) => x.id);
+    const recentN = Math.min(NO_REPEAT, Math.max(0, pool.length - queued.length - 4));
+    const recent = media.slice(-Math.max(recentN + queued.length, 1)).map((x) => x.id);
+    let batch = nextBatch(pool, off, Math.random, new Set([...queued, ...recent]));
+    if (!batch.length) batch = nextBatch(pool, off, Math.random, new Set(queued)); // tiny pools: relax, but still no back-to-back repeats
+    if (!batch.length) return 0;
+    const items = withRecaps(batch); const start = feedItems.length;
+    feedItems.push(...items);
+    const f = $('#feed'); f.insertAdjacentHTML('beforeend', items.map((it, k) => itemHTML(it, start + k)).join(''));
+    $$('.item', f).slice(start).forEach((el) => { el.classList.add('dry'); el.innerHTML = ''; io.observe(el); });
+    return items.length;
+  })().finally(() => { appending = null; });
+  return appending;
+}
+function dehydrate(x) {
+  if (x.classList.contains('dry')) return;
+  unmountYT(x); unloadVideo(x); x.innerHTML = ''; x.classList.add('dry');
+}
+function hydrate(x, i) {
+  if (!x.classList.contains('dry')) return;
+  const it = feedItems[i]; if (!it) return;
+  const t = document.createElement('template'); t.innerHTML = itemHTML(it, i).trim(); const n = t.content.firstElementChild;
+  x.className = n.className; x.innerHTML = n.innerHTML;
+  if (it.kind === 'file') { const s2 = pickSource(it); if (s2 && S.media[s2.url]) markDownloaded(it.id); }
 }
 
 // ---------- rendering ----------
@@ -430,9 +478,15 @@ function activate(el) {
   // Keep previous/current/next warm, unmount far items to save memory.
   $$('#feed .item').forEach((x) => {
     const i = +x.dataset.idx; const d = i - idx; const xi = feedItems[i]; if (!xi) return;
+    if (Math.abs(d) > DRY_FAR) { dehydrate(x); return; }
+    if (Math.abs(d) <= HYDRATE_NEAR) hydrate(x, i);
     if (xi.kind === 'file') { if (Math.abs(d) > 2) unloadVideo(x); else if (d !== 0) setVideoSrc(x, xi, d === 1 ? 'auto' : 'metadata'); }
     if (xi.kind === 'youtube') { if (Math.abs(d) <= 1) mountYT(x, xi, { active: d === 0 }); else unmountYT(x); }
   });
+  if (idx >= feedItems.length - REFILL_AT) {
+    appendBatch();
+    if (online()) refreshContent({ minGap: 2 * 60 * 1000 }); // background fresh fetch; results join later batches
+  }
   if (!it) return;
   if (it.kind !== 'learn' && it.kind !== 'end') { S.seen[it.id] = Date.now(); save(); seenPut(it.id, S.seen[it.id]); }
   if (it.kind === 'file') {
@@ -784,12 +838,12 @@ async function roomForFresh(need) {
   return usedBytes() + need <= capBytes();
 }
 
-function refreshContent({ manual = false } = {}) {
+function refreshContent({ manual = false, minGap = FRESH_MIN_GAP } = {}) {
   if (freshBusy) return freshBusy;
   freshBusy = (async () => {
     const res = { ok: false, text: 0, videos: 0, catalog: 0, found: 0, skipped: '' };
     if (!online()) { res.skipped = 'offline'; if (manual) toast('You are offline — connect to get new content'); return res; }
-    if (!manual && S.fresh && Date.now() - (S.fresh.last || 0) < FRESH_MIN_GAP) { res.skipped = 'recent'; return res; }
+    if (!manual && S.fresh && Date.now() - (S.fresh.last || 0) < minGap) { res.skipped = 'recent'; return res; }
     setFreshStatus('Checking for new content…');
     const topics = S.topics.length ? S.topics : CAT.topics.map((t) => t.id);
     const textTopics = pickN(topics, 8);
@@ -859,7 +913,7 @@ async function boot() {
   updateOnline(false); updateTimer();
   if (!S.topics.length) await onboard();
   await buildFeed();
-  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, ytLog: () => ytLog, ytApiFailed: () => ytApiFailed, version: APP_VERSION, seenLoad, fresh: () => CAT.items.filter((i) => i.fresh) };
+  window.__lumen = { state: () => S, feed: () => feedItems, buildFeed, download, byId: () => byId, updateTimer, refresh: refreshContent, sound: () => soundOn, yt: () => ytPlayers, ytLog: () => ytLog, ytApiFailed: () => ytApiFailed, version: APP_VERSION, seenLoad, appendBatch, fresh: () => CAT.items.filter((i) => i.fresh) };
   setTimeout(() => refreshContent(), 2000);
 }
 boot();
